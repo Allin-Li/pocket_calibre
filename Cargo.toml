@@ -1,0 +1,44 @@
+[package]
+name = "pocket_calibre"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# sdk-6-5 — под прошивку U632.6.5.x. Для другой прошивки меняется в обеих
+# строках сразу.
+inkview = { version = "0.3", default-features = false, features = ["sdk-6-5"] }
+inkview-slint = { version = "0.3", default-features = false, features = [
+    "sdk-6-5",
+] }
+slint = { version = "1.17", default-features = false, features = [
+    "compat-1-2",
+    "std",
+    "renderer-software",
+] }
+euclid = "0.22"
+rgb = "0.8"
+
+# В коде не используется. Нужен только чтобы включить `fontconfig-dlopen` тому
+# `fontique`, который тянет i-slint-core: иначе его build.rs зовёт pkg-config,
+# а тот не умеет кросс-компиляцию без sysroot для armv7. С этой фичей
+# libfontconfig грузится через dlopen, а если её на ридере нет — fontique
+# штатно отдаёт пустой набор системных шрифтов. Нам это и надо: глифы вшиты
+# в бинарник компилятором .slint, см. build.rs.
+fontique = { version = "0.10", features = ["fontconfig-dlopen"] }
+
+# Без TLS: calibre content server живёт в локальной сети по http, а rustls
+# заметно утяжелил бы кросс-сборку. Понадобится https — включить фичу "rustls".
+ureq = { version = "3", default-features = false, features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = { version = "1.1.3", default-features = false, features = ["display", "parse", "serde", "std"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
+
+[build-dependencies]
+slint-build = "1.17"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
