@@ -7,15 +7,23 @@ export struct BookItem {
     cover: image,
 }
 
+// Все размеры интерфейса задаются в миллиметрах и умножаются на `mm` —
+// число логических пикселей в одном миллиметре. Его считает Rust из реального
+// dpi экрана и scale_factor, поэтому вёрстка физически одинакова на любом
+// устройстве, а не «доля экрана на глаз».
+export global Metrics {
+    in property <length> mm: 3.94px;   // дефолт под 300dpi @scale3, до замера
+}
+
 component FlatButton inherits Rectangle {
     in property <string> label;
     in property <bool> enabled: true;
-    in property <length> text-size: 22px;
+    in property <length> text-size: 3mm;
     callback clicked();
 
-    border-width: 2px;
+    border-width: 1px;
     border-color: root.enabled ? #000000 : #999999;
-    border-radius: 4px;
+    border-radius: 1 * Metrics.mm;
     background: touch.pressed ? #000000 : #ffffff;
 
     Text {
@@ -35,7 +43,6 @@ component FlatButton inherits Rectangle {
 }
 
 component SettingRow inherits Rectangle {
-    in property <length> unit;
     in property <string> label;
     in property <string> value;
     callback clicked();
@@ -43,20 +50,20 @@ component SettingRow inherits Rectangle {
     background: touch.pressed ? #cccccc : #ffffff;
 
     VerticalLayout {
-        padding-left: root.unit * 0.4;
-        padding-right: root.unit * 0.4;
+        padding-left: 1.5 * Metrics.mm;
+        padding-right: 1.5 * Metrics.mm;
         alignment: center;
-        spacing: root.unit * 0.25;
+        spacing: 0.6 * Metrics.mm;
 
         Text {
             text: root.label;
-            font-size: root.unit * 0.75;
+            font-size: 2.5 * Metrics.mm;
             color: #555555;
         }
 
         Text {
             text: root.value;
-            font-size: root.unit;
+            font-size: 3.3 * Metrics.mm;
             color: #000000;
             overflow: elide;
         }
@@ -84,6 +91,7 @@ export component MainWindow inherits Window {
     in property <string> page-label;
     in property <bool> has-prev;
     in property <bool> has-next;
+    in property <string> build-id;
 
     in property <string> cfg-server;
     in property <string> cfg-user;
@@ -114,16 +122,9 @@ export component MainWindow inherits Window {
     // свойства не вычищаются оптимизатором.
     in property <string> glyph-set: "АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯабвгдеёжзийклмнопрстуфхцчшщъыьэюяІіЇїЄєҐґЎў«»„“”—–…•№±§°←→ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖØÙÚÛÜÝÞßàáâãäåæçèéêëìíîïðñòóôõöøùúûüýþÿĀāĆćČčĐđĘęĞğŁłŃńŇňŐőŒœŘřŚśŞşŠšŤťŰűŸŹźŻżŽž";
 
-    // Базовый размер, от которого пляшет вся вёрстка. Масштаб экрана
-    // PocketBook заранее неизвестен: логический размер зависит от dpi и scale,
-    // которые сообщает прошивка.
-    //
-    // Считает его Rust по фактическому размеру окна и присылает сюда. Вывести
-    // его прямо здесь из `root.height` нельзя: высота окна определяется
-    // лэйаутом, лэйаут — размерами шрифтов, а те — этим самым свойством, то
-    // есть получается петля привязок.
-    in property <length> unit: 18px;
-    property <length> row-height: root.unit * 4;
+    // Высота строки списка — она же основа для числа строк на странице.
+    // 11 мм ≈ комфортная цель для тапа пальцем на e-ink.
+    property <length> row-height: 11 * Metrics.mm;
 
     // Сколько строк влезает на страницу — это же число Rust читает, чтобы
     // нарезать список.
@@ -155,39 +156,34 @@ export component MainWindow inherits Window {
         }
 
         VerticalLayout {
-            padding: root.unit;
-            spacing: root.unit * 0.6;
-
-            VerticalLayout {
-                spacing: 2px;
-                Text {
-                    text: "pocket_calibre";
-                    font-size: root.unit * 1.4;
-                    font-weight: 700;
-                    color: #000000;
-                }
-
-                Text {
-                    text: root.server;
-                    font-size: root.unit * 0.75;
-                    color: #555555;
-                    overflow: elide;
-                }
-            }
-
-            Rectangle {
-                height: 2px;
-                background: #000000;
-            }
+            padding: 2 * Metrics.mm;
+            spacing: 1.5 * Metrics.mm;
 
             HorizontalLayout {
-                spacing: root.unit * 0.6;
-                alignment: start;
+                spacing: 2 * Metrics.mm;
+
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    alignment: center;
+                    Text {
+                        text: "pocket_calibre";
+                        font-size: 4 * Metrics.mm;
+                        font-weight: 700;
+                        color: #000000;
+                    }
+
+                    Text {
+                        text: root.server;
+                        font-size: 2.4 * Metrics.mm;
+                        color: #555555;
+                        overflow: elide;
+                    }
+                }
 
                 FlatButton {
-                    height: root.unit * 2.6;
-                    min-width: root.unit * 7;
-                    text-size: root.unit;
+                    height: 10 * Metrics.mm;
+                    min-width: 20 * Metrics.mm;
+                    text-size: 3 * Metrics.mm;
                     label: root.busy ? "Подождите…" : "Обновить";
                     enabled: !root.busy && !root.settings-open;
                     clicked => {
@@ -196,14 +192,19 @@ export component MainWindow inherits Window {
                 }
 
                 FlatButton {
-                    height: root.unit * 2.6;
-                    min-width: root.unit * 7;
-                    text-size: root.unit;
+                    height: 10 * Metrics.mm;
+                    min-width: 20 * Metrics.mm;
+                    text-size: 3 * Metrics.mm;
                     label: root.settings-open ? "Готово" : "Настройки";
                     clicked => {
                         root.toggle-settings();
                     }
                 }
+            }
+
+            Rectangle {
+                height: 2px;
+                background: #000000;
             }
 
             // Область под содержимое. Ничего не прокручивается: и список книг,
@@ -216,7 +217,6 @@ export component MainWindow inherits Window {
                     alignment: start;
 
                     SettingRow {
-                        unit: root.unit;
                         height: root.row-height;
                         label: "Адрес сервера";
                         value: root.cfg-server;
@@ -226,7 +226,6 @@ export component MainWindow inherits Window {
                     }
 
                     SettingRow {
-                        unit: root.unit;
                         height: root.row-height;
                         label: "Логин";
                         value: root.cfg-user;
@@ -236,7 +235,6 @@ export component MainWindow inherits Window {
                     }
 
                     SettingRow {
-                        unit: root.unit;
                         height: root.row-height;
                         label: "Пароль";
                         value: root.cfg-password;
@@ -246,7 +244,6 @@ export component MainWindow inherits Window {
                     }
 
                     SettingRow {
-                        unit: root.unit;
                         height: root.row-height;
                         label: "Библиотека";
                         value: root.cfg-library;
@@ -256,7 +253,6 @@ export component MainWindow inherits Window {
                     }
 
                     SettingRow {
-                        unit: root.unit;
                         height: root.row-height;
                         label: "Папка загрузки";
                         value: root.cfg-download-dir;
@@ -266,7 +262,6 @@ export component MainWindow inherits Window {
                     }
 
                     SettingRow {
-                        unit: root.unit;
                         height: root.row-height;
                         label: "Форматы";
                         value: root.cfg-formats;
@@ -276,7 +271,6 @@ export component MainWindow inherits Window {
                     }
 
                     SettingRow {
-                        unit: root.unit;
                         height: root.row-height;
                         label: "Сколько книг показывать";
                         value: root.cfg-limit;
@@ -294,12 +288,12 @@ export component MainWindow inherits Window {
                         background: row.pressed ? #cccccc : #ffffff;
 
                         HorizontalLayout {
-                            padding-left: root.unit * 0.4;
-                            padding-right: root.unit * 0.4;
-                            spacing: root.unit * 0.6;
+                            padding-left: 1 * Metrics.mm;
+                            padding-right: 1 * Metrics.mm;
+                            spacing: 2 * Metrics.mm;
 
                             Image {
-                                width: root.row-height * 0.62;
+                                width: root.row-height * 0.66;
                                 source: book.cover;
                                 image-fit: contain;
                             }
@@ -307,27 +301,27 @@ export component MainWindow inherits Window {
                             VerticalLayout {
                                 alignment: center;
                                 horizontal-stretch: 1;
-                                spacing: root.unit * 0.2;
+                                spacing: 0.5 * Metrics.mm;
 
                                 Text {
                                     text: book.title;
-                                    font-size: root.unit;
+                                    font-size: 3.3 * Metrics.mm;
                                     color: #000000;
                                     overflow: elide;
                                 }
 
                                 Text {
                                     text: book.author;
-                                    font-size: root.unit * 0.8;
+                                    font-size: 2.7 * Metrics.mm;
                                     color: #444444;
                                     overflow: elide;
                                 }
                             }
 
                             Text {
-                                width: root.unit * 5;
+                                width: 20 * Metrics.mm;
                                 text: book.state == "" ? book.format : book.state;
-                                font-size: root.unit * 0.8;
+                                font-size: 2.6 * Metrics.mm;
                                 color: #000000;
                                 horizontal-alignment: right;
                                 vertical-alignment: center;
@@ -351,12 +345,12 @@ export component MainWindow inherits Window {
             }
 
             if !root.settings-open: HorizontalLayout {
-                spacing: root.unit * 0.6;
+                spacing: 2 * Metrics.mm;
 
                 FlatButton {
-                    height: root.unit * 2.6;
-                    width: root.unit * 5;
-                    text-size: root.unit * 1.2;
+                    height: 10 * Metrics.mm;
+                    width: 18 * Metrics.mm;
+                    text-size: 4 * Metrics.mm;
                     label: "←";
                     enabled: root.has-prev;
                     clicked => {
@@ -367,16 +361,16 @@ export component MainWindow inherits Window {
                 Text {
                     horizontal-stretch: 1;
                     text: root.page-label;
-                    font-size: root.unit;
+                    font-size: 2.9 * Metrics.mm;
                     color: #000000;
                     horizontal-alignment: center;
                     vertical-alignment: center;
                 }
 
                 FlatButton {
-                    height: root.unit * 2.6;
-                    width: root.unit * 5;
-                    text-size: root.unit * 1.2;
+                    height: 10 * Metrics.mm;
+                    width: 18 * Metrics.mm;
+                    text-size: 4 * Metrics.mm;
                     label: "→";
                     enabled: root.has-next;
                     clicked => {
@@ -390,11 +384,22 @@ export component MainWindow inherits Window {
                 background: #000000;
             }
 
-            Text {
-                text: root.status;
-                font-size: root.unit * 0.8;
-                color: #000000;
-                overflow: elide;
+            HorizontalLayout {
+                spacing: 2 * Metrics.mm;
+
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.status;
+                    font-size: 2.6 * Metrics.mm;
+                    color: #000000;
+                    overflow: elide;
+                }
+
+                Text {
+                    text: root.build-id;
+                    font-size: 2.6 * Metrics.mm;
+                    color: #888888;
+                }
             }
         }
     }

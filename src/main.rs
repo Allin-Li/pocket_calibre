@@ -247,6 +247,11 @@ fn ui_main(iv: &'static Inkview, evt_rx: Receiver<Event>, redraw_rx: Receiver<()
     }
 
     let screen = Screen::new(iv);
+    // Физический dpi экрана — основа вёрстки: все размеры задаются в
+    // миллиметрах и переводятся в логические пиксели с учётом dpi и
+    // scale_factor. Для PB632 dpi=300; на всякий случай подстраховываемся от
+    // нулевого значения, чтобы не делить интерфейс на ноль.
+    let screen_dpi = screen.dpi().max(1) as f32;
     let backend = inkview_slint::Backend::new(screen, evt_rx);
     slint::platform::set_platform(Box::new(backend)).expect("платформа уже установлена");
 
@@ -262,6 +267,10 @@ fn ui_main(iv: &'static Inkview, evt_rx: Receiver<Event>, redraw_rx: Receiver<()
     let (answer_tx, answer_rx) = mpsc::channel::<keyboard::Answer>();
 
     keyboard::init(iv, answer_tx);
+
+    // Идентификатор сборки виден на устройстве постоянно — чтобы не гадать,
+    // какой билд запущен.
+    window.set_build_id(concat!("build ", env!("BUILD_ID")).into());
 
     let books = Rc::new(VecModel::<BookItem>::default());
     window.set_books(ModelRc::from(books.clone()));
@@ -339,31 +348,23 @@ fn ui_main(iv: &'static Inkview, evt_rx: Receiver<Event>, redraw_rx: Receiver<()
         let cfg = cfg.clone();
         let cmd_tx = cmd_tx.clone();
         let cfg_path = cfg_path.clone();
-        let reported_screen = Cell::new(false);
 
         move || {
             let Some(window) = weak.upgrade() else {
                 return;
             };
 
-            // Размер окна известен только после того, как бэкенд запустил
-            // цикл, поэтому вёрстку домеряем здесь, а не при старте.
-            let size = window.window().size();
+            // scale_factor бэкенд выставляет только после старта своего цикла,
+            // поэтому «миллиметр в логических пикселях» пересчитываем здесь.
+            // 1 мм = dpi/25.4 физических px, а логические = физические /
+            // scale_factor. Отсюда вся вёрстка получает физически корректный
+            // масштаб на любом экране.
             let scale = window.window().scale_factor();
-
-            if size.height > 0 && scale > 0.0 {
-                // Сорок «юнитов» в высоту — примерно шесть строк списка плюс
-                // шапка и подвал при любом масштабе экрана.
-                let unit = (size.height as f32 / scale / 40.0).max(12.0);
-                if (window.get_unit() - unit).abs() > 0.01 {
-                    window.set_unit(unit);
-                }
-
-                if !reported_screen.replace(true) {
-                    let server = window.get_server();
-                    window.set_server(
-                        format!("{server} · {}×{} @{scale:.2}", size.width, size.height).into(),
-                    );
+            if scale > 0.0 {
+                let mm = screen_dpi / 25.4 / scale;
+                let metrics = window.global::<Metrics>();
+                if (metrics.get_mm() - mm).abs() > 0.001 {
+                    metrics.set_mm(mm);
                 }
             }
 
