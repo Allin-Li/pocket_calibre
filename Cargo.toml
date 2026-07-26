@@ -16,8 +16,6 @@ slint = { version = "1.17", default-features = false, features = [
     "std",
     "renderer-software",
 ] }
-euclid = "0.22"
-rgb = "0.8"
 
 # В коде не используется. Нужен только чтобы включить `fontconfig-dlopen` тому
 # `fontique`, который тянет i-slint-core: иначе его build.rs зовёт pkg-config,

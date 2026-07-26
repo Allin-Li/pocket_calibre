@@ -3473,12 +3473,10 @@ dependencies = [
 name = "pocket_calibre"
 version = "0.1.0"
 dependencies = [
- "euclid",
  "fontique",
  "image",
  "inkview",
  "inkview-slint",
- "rgb",
  "serde",
  "serde_json",
  "slint",

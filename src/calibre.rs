@@ -235,11 +235,20 @@ impl Client {
         );
 
         let tmp = dir.join(format!(".{name}.part"));
-        let mut resp = self.get(&url)?;
-        {
+        let fetch = || -> Result<(), Error> {
+            let mut resp = self.get(&url)?;
             let mut file = std::fs::File::create(&tmp)?;
             std::io::copy(&mut resp.body_mut().as_reader(), &mut file)?;
             file.flush()?;
+            Ok(())
+        };
+
+        // Оборванная закачка не должна оставлять недописанный `.part` в папке
+        // книг: следующая попытка его перезапишет, но если её не будет, мусор
+        // так и останется лежать у пользователя на виду.
+        if let Err(e) = fetch() {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
         }
 
         std::fs::rename(&tmp, &target)?;

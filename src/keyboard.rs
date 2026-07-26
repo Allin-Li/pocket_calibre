@@ -112,7 +112,16 @@ pub fn init(iv: &'static Inkview, answers: Sender<Answer>) {
 pub fn request(field: Field, initial: String) {
     let Some(iv) = IV.get() else { return };
 
-    *PENDING.lock().unwrap() = Some(Request { field, initial });
+    // Вторая заявка, пока не отработала первая, затирала бы её: trampoline
+    // забирает PENDING ровно один раз, и первое поле молча терялось бы. Про
+    // «уже открыта» спрашиваем прошивку, а не свой ACTIVE: если колбэк
+    // почему-то не придёт, мы не запрём клавиатуру навсегда.
+    let mut pending = PENDING.lock().unwrap();
+    if pending.is_some() || is_open(iv) {
+        return;
+    }
+    *pending = Some(Request { field, initial });
+    drop(pending);
 
     unsafe {
         iv.SetWeakTimerEx(
