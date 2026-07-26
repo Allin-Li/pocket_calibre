@@ -5,7 +5,7 @@ mod libm_shim;
 mod net;
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -26,6 +26,15 @@ slint::include_modules!();
 /// масштабов экрана: лишнее Slint ужмёт, а тянуть полную обложку на 230 КБ
 /// ради строки списка незачем.
 const COVER_SIZE: (u32, u32) = (120, 170);
+
+/// Сколько распакованных обложек держим в памяти.
+///
+/// В кэше лежит уже развёрнутый RGB: 120×170×3 ≈ 60 КБ на книгу. Без предела
+/// пролистанная библиотека на 5000 книг (столько разрешает `limit`) осела бы
+/// сотнями мегабайт на устройстве с 512 МБ ОЗУ. 64 обложки — это около 4 МБ и
+/// примерно шесть страниц истории, то есть заведомо больше одной страницы:
+/// вытеснение никогда не заденет то, что показано прямо сейчас.
+const COVER_CACHE_LIMIT: usize = 64;
 
 /// Команды от UI к рабочему потоку.
 enum Cmd {
@@ -63,6 +72,18 @@ fn main() {
         .expect("не удалось запустить UI-поток");
 
     inkview::iv_main(iv, move |event| {
+        // EVT_EXIT обрабатываем первым и до всех фильтров ниже: наш обработчик
+        // отвечает прошивке RES_EVENT_HANDLED, то есть «событие принято», и
+        // закрыть приложение обязаны мы сами. Бэкенд inkview-slint это событие
+        // не переводит вовсе, а его цикл — бесконечный `loop`, так что без
+        // явного CloseApp выйти из приложения штатно нельзя.
+        if matches!(event, Event::Exit) {
+            unsafe {
+                iv.CloseApp();
+            }
+            return Some(());
+        }
+
         // Пока открыта нативная клавиатура, ввод принадлежит ей: пробрасывать
         // тапы в Slint значило бы жать кнопки под клавиатурой.
         if keyboard::is_open(iv) {
@@ -112,9 +133,18 @@ struct Pager {
 
     all: RefCell<Vec<Book>>,
     covers: RefCell<HashMap<i64, Image>>,
+    /// Порядок попадания в `covers` — по нему вытесняем самые старые обложки.
+    cover_order: RefCell<VecDeque<i64>>,
+    /// Что уже заказано у рабочего потока. Без этого каждая пришедшая обложка
+    /// снова просила бы все ещё не пришедшие: на страницу из N книг выходило
+    /// порядка N²/2 запросов к серверу.
+    requested: RefCell<HashSet<i64>>,
     states: RefCell<HashMap<i64, &'static str>>,
     page: Cell<usize>,
     rows: Cell<usize>,
+    /// Модель изменилась, но перерисовку отложили до конца разбора очереди
+    /// сообщений — см. [`Pager::flush`].
+    dirty: Cell<bool>,
 }
 
 impl Pager {
@@ -129,15 +159,20 @@ impl Pager {
             cmd_tx,
             all: RefCell::new(Vec::new()),
             covers: RefCell::new(HashMap::new()),
+            cover_order: RefCell::new(VecDeque::new()),
+            requested: RefCell::new(HashSet::new()),
             states: RefCell::new(HashMap::new()),
             page: Cell::new(0),
             rows: Cell::new(1),
+            dirty: Cell::new(false),
         }
     }
 
     fn set_books(&self, books: Vec<Book>) {
         *self.all.borrow_mut() = books;
         self.covers.borrow_mut().clear();
+        self.cover_order.borrow_mut().clear();
+        self.requested.borrow_mut().clear();
         self.states.borrow_mut().clear();
         self.page.set(0);
         self.render();
@@ -167,19 +202,69 @@ impl Pager {
 
     fn set_state(&self, id: i64, state: &'static str) {
         self.states.borrow_mut().insert(id, state);
-        self.render();
+        self.dirty.set(true);
     }
 
     fn set_cover(&self, id: i64, image: Image) {
-        self.covers.borrow_mut().insert(id, image);
-        self.render();
+        {
+            let mut covers = self.covers.borrow_mut();
+            let mut order = self.cover_order.borrow_mut();
+
+            if covers.insert(id, image).is_none() {
+                order.push_back(id);
+            }
+
+            // Вытесняем самые старые. Заодно забываем, что их заказывали:
+            // если пользователь вернётся на ту страницу, обложка загрузится
+            // заново, а не останется дырой.
+            while order.len() > COVER_CACHE_LIMIT {
+                let Some(old) = order.pop_front() else { break };
+                covers.remove(&old);
+                self.requested.borrow_mut().remove(&old);
+            }
+        }
+
+        // Обложка книги с другой страницы ничего на экране не меняет, а
+        // перерисовка на e-ink стоит полного обновления области. Пока
+        // пользователь листает вперёд, ответы на заказы предыдущих страниц
+        // продолжают приходить — молча кладём их в кэш.
+        if self.is_visible(id) {
+            self.dirty.set(true);
+        }
+    }
+
+    /// Перерисовывает, если с прошлого раза что-то менялось. Зовётся один раз
+    /// на разбор очереди сообщений: иначе пачка из N обложек давала бы N
+    /// полных сбросов модели подряд.
+    fn flush(&self) {
+        if self.dirty.get() {
+            self.render();
+        }
     }
 
     fn total_pages(&self) -> usize {
         self.all.borrow().len().div_ceil(self.rows.get().max(1)).max(1)
     }
 
+    /// Диапазон видимых книг в `all` для текущей страницы.
+    fn page_range(&self) -> (usize, usize) {
+        let len = self.all.borrow().len();
+        let rows = self.rows.get().max(1);
+        let page = self.page.get().min(len.div_ceil(rows).max(1) - 1);
+
+        let start = (page * rows).min(len);
+        (start, (start + rows).min(len))
+    }
+
+    fn is_visible(&self, id: i64) -> bool {
+        let (start, end) = self.page_range();
+
+        self.all.borrow()[start..end].iter().any(|b| b.id == id)
+    }
+
     fn render(&self) {
+        self.dirty.set(false);
+
         let Some(window) = self.window.upgrade() else {
             return;
         };
@@ -223,11 +308,14 @@ impl Pager {
         window.set_has_next(page + 1 < total);
 
         // Обложки грузим только для показанной страницы — это и есть главная
-        // выгода пагинации перед списком на 200 строк.
+        // выгода пагинации перед списком на 200 строк. Уже заказанные
+        // пропускаем: render() зовётся и на каждую пришедшую обложку, так что
+        // без этой проверки страница переспрашивала бы сама себя по кругу.
+        let mut requested = self.requested.borrow_mut();
         let missing: Vec<i64> = visible
             .iter()
             .map(|book| book.id)
-            .filter(|id| !covers.contains_key(id))
+            .filter(|id| !covers.contains_key(id) && requested.insert(*id))
             .collect();
 
         if !missing.is_empty() {
@@ -373,6 +461,10 @@ fn ui_main(iv: &'static Inkview, evt_rx: Receiver<Event>, redraw_rx: Receiver<()
             while let Ok(msg) = msg_rx.try_recv() {
                 apply(&window, &pager, msg);
             }
+            // Одна перерисовка на всю разобранную пачку: пришедшие разом
+            // обложки и статусы книг иначе дали бы по полному сбросу модели
+            // каждая, а на e-ink это заметно.
+            pager.flush();
 
             while let Ok((field, value)) = answer_rx.try_recv() {
                 apply_answer(&window, &cfg, &cfg_path, &cmd_tx, field, value);
@@ -453,6 +545,8 @@ fn apply_answer(
     let value = value.trim().to_string();
     let optional = |v: String| if v.is_empty() { None } else { Some(v) };
 
+    let before = cfg.borrow().clone();
+
     {
         let mut cfg = cfg.borrow_mut();
         match field {
@@ -482,8 +576,15 @@ fn apply_answer(
     let cfg = cfg.borrow();
     show_config(window, &cfg);
 
+    // Reconfigure пересоздаёт клиента и сбрасывает список книг, поэтому шлём
+    // его только если настройки правда изменились. Иначе достаточно было
+    // открыть поле и нажать «ОК», ничего не правя, — и список пропадал.
+    if *cfg == before {
+        return;
+    }
+
     match cfg.save(cfg_path) {
-        Ok(()) => window.set_status("Настройки сохранены".into()),
+        Ok(()) => window.set_status("Настройки сохранены — нажмите «Обновить»".into()),
         Err(e) => window.set_status(format!("Не удалось сохранить настройки: {e}").into()),
     }
 

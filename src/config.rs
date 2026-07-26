@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// `serde(default)` означает, что отсутствующий ключ берётся из [`Default`]:
 /// файл можно урезать до одного `server`, и всё остальное подставится.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub server: String,
@@ -113,6 +113,15 @@ impl Config {
 
 /// Убирает из имени файла всё, что может не понравиться FAT-разделу ридера.
 pub fn sanitize_filename(name: &str) -> String {
+    // Хвостовые точки и пробелы на FAT недопустимы, а ведущие пробелы просто
+    // мусор. Точки и пробелы снимаются вперемешку, иначе «имя. .» оставило бы
+    // хвост после первого же прохода.
+    let trim = |s: &str| {
+        s.trim_start()
+            .trim_end_matches(|c: char| c == '.' || c.is_whitespace())
+            .to_string()
+    };
+
     let cleaned: String = name
         .chars()
         .map(|c| match c {
@@ -122,12 +131,16 @@ pub fn sanitize_filename(name: &str) -> String {
         })
         .collect();
 
-    let cleaned = cleaned.trim().trim_end_matches('.').to_string();
+    let mut cleaned = trim(&cleaned);
 
     // Ограничение длины имени на FAT32 — 255 байт, режем с запасом по символам.
     if cleaned.chars().count() > 120 {
-        cleaned.chars().take(120).collect()
-    } else if cleaned.is_empty() {
+        // Обрезка могла оставить на конце ту самую точку или пробел, ради
+        // которых был первый trim, — повторяем его уже по факту.
+        cleaned = trim(&cleaned.chars().take(120).collect::<String>());
+    }
+
+    if cleaned.is_empty() {
         "book".to_string()
     } else {
         cleaned
@@ -166,6 +179,21 @@ mod tests {
         assert_eq!(parsed.download_dir, cfg.download_dir);
         assert_eq!(parsed.formats, cfg.formats);
         assert_eq!(parsed.limit, cfg.limit);
+    }
+
+    #[test]
+    fn sanitize_filename_cleans_edges_and_length() {
+        assert_eq!(sanitize_filename("Автор - Книга"), "Автор - Книга");
+        assert_eq!(sanitize_filename("a/b:c*d?e\"f<g>h|i"), "a_b_c_d_e_f_g_h_i");
+        assert_eq!(sanitize_filename("  имя. . "), "имя");
+        assert_eq!(sanitize_filename(""), "book");
+        assert_eq!(sanitize_filename("..."), "book");
+
+        // Обрезка длинного имени не должна оставлять хвостовую точку.
+        let long = format!("{}. хвост", "я".repeat(119));
+        let cut = sanitize_filename(&long);
+        assert_eq!(cut.chars().count(), 119);
+        assert!(!cut.ends_with('.') && !cut.ends_with(' '));
     }
 
     #[test]

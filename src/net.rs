@@ -1,16 +1,18 @@
-use inkview::bindings::Inkview;
+use inkview::bindings::{Inkview, NET_CONNECTED};
 
 /// Поднимает Wi-Fi, если он выключен.
 ///
-/// `QueryNetwork` возвращает битовую маску состояния; ненулевой бит
-/// `NET_CONNECTED` означает, что соединение уже есть. `NetConnect(NULL)`
-/// подключается к последней использованной сети и сам показывает системный
-/// диалог, если нужна ручная настройка.
+/// `QueryNetwork` возвращает битовую маску состояния. `NET_CONNECTED` — это не
+/// один бит, а маска 0xF00 поверх бит готовности интерфейсов (`NET_BTREADY`,
+/// `NET_WIFIREADY`, `NET_CDMA3GREADY`), поэтому берём константу из SDK, а не
+/// пишем число руками: младшие биты маски состояния — это `NET_BLUETOOTH`,
+/// `NET_WIFI`, `NET_CDMA3G`, то есть «интерфейс вообще есть», а не «подключён».
+///
+/// `NetConnect(NULL)` подключается к последней использованной сети и сам
+/// показывает системный диалог, если нужна ручная настройка.
 pub fn ensure_online(iv: &Inkview) -> Result<(), String> {
-    const NET_CONNECTED: i32 = 0x00000001;
-
     unsafe {
-        if iv.QueryNetwork() & NET_CONNECTED != 0 {
+        if iv.QueryNetwork() & NET_CONNECTED as i32 != 0 {
             return Ok(());
         }
 
