@@ -22,18 +22,22 @@ use keyboard::Field;
 
 slint::include_modules!();
 
-/// Размер миниатюры, который просим у сервера. Подходит для обоих вероятных
-/// масштабов экрана: лишнее Slint ужмёт, а тянуть полную обложку на 230 КБ
-/// ради строки списка незачем.
-const COVER_SIZE: (u32, u32) = (120, 170);
-
-/// Сколько распакованных обложек держим в памяти.
+/// Thumbnail size we ask the server for, in physical pixels.
 ///
-/// В кэше лежит уже развёрнутый RGB: 120×170×3 ≈ 60 КБ на книгу. Без предела
-/// пролистанная библиотека на 5000 книг (столько разрешает `limit`) осела бы
-/// сотнями мегабайт на устройстве с 512 МБ ОЗУ. 64 обложки — это около 4 МБ и
-/// примерно шесть страниц истории, то есть заведомо больше одной страницы:
-/// вытеснение никогда не заденет то, что показано прямо сейчас.
+/// This is the size the cover is actually drawn at: a list row is 11 mm tall
+/// and the image is 0.66 of that wide, which on the PB632's 300 dpi panel comes
+/// out at roughly 86x130 px. Asking for more only cost memory and bandwidth,
+/// since Slint scaled it straight back down. Tied to 300 dpi — a denser panel
+/// would want this derived from `Screen::dpi` instead.
+const COVER_SIZE: (u32, u32) = (88, 132);
+
+/// How many covers we keep in memory.
+///
+/// At 4 bits per pixel a cover is about 5.8 KB, so the cache tops out near
+/// 370 KB — some eight pages of history. The bound matters because `limit`
+/// allows 5000 books: unbounded, paging through a library grew without end on a
+/// device with 512 MB of RAM. It also makes eviction safe to do blindly, as 64
+/// is far more than a single page can hold.
 const COVER_CACHE_LIMIT: usize = 64;
 
 /// Команды от UI к рабочему потоку.
@@ -50,12 +54,97 @@ enum Msg {
     Busy(bool),
     Books(Vec<Book>),
     BookState(i32, &'static str),
-    Cover {
-        id: i64,
-        rgb: Vec<u8>,
-        width: u32,
-        height: u32,
-    },
+    Cover { id: i64, cover: CachedCover },
+}
+
+/// A cached cover: 4 bits per pixel, two pixels to a byte.
+///
+/// The panel shows 16 grey levels, so a nibble per pixel is everything that
+/// survives being displayed — colour and the low bits of luminance are dropped
+/// by the screen regardless. Against decoded RGB that is a 32x saving (5.8 KB
+/// versus 190 KB for the same picture), and it is what keeps [`COVER_CACHE_LIMIT`]
+/// covers well under a megabyte.
+///
+/// Rows are byte-aligned. The server preserves aspect ratio when fitting a cover
+/// into [`COVER_SIZE`], so the width is whatever it likes — odd values included.
+struct CachedCover {
+    width: u32,
+    height: u32,
+    pixels: Vec<u8>,
+}
+
+impl CachedCover {
+    fn stride(width: u32) -> usize {
+        (width as usize).div_ceil(2)
+    }
+
+    /// Decodes a JPEG thumbnail and packs it. Called on the worker thread: this
+    /// is the expensive half, and the UI thread must not stall on it.
+    fn pack(jpeg: &[u8]) -> Result<Self, calibre::Error> {
+        let gray = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg)?.to_luma8();
+
+        Ok(Self::from_gray(&gray))
+    }
+
+    fn from_gray(gray: &image::GrayImage) -> Self {
+        let (width, height) = gray.dimensions();
+        let stride = Self::stride(width);
+
+        let mut pixels = vec![0u8; stride * height as usize];
+        for (x, y, px) in gray.enumerate_pixels() {
+            // 0..=255 -> 0..=15: the top nibble is the grey level.
+            let level = px.0[0] >> 4;
+            let byte = &mut pixels[y as usize * stride + x as usize / 2];
+            if x.is_multiple_of(2) {
+                *byte = level << 4;
+            } else {
+                *byte |= level;
+            }
+        }
+
+        Self {
+            width,
+            height,
+            pixels,
+        }
+    }
+
+    /// Grey level of a pixel, 0..=15.
+    fn level(&self, x: usize, y: usize) -> u8 {
+        let byte = self.pixels[y * Self::stride(self.width) + x / 2];
+
+        if x.is_multiple_of(2) {
+            byte >> 4
+        } else {
+            byte & 0x0f
+        }
+    }
+
+    /// Expands back to RGB, the only thing Slint takes — it has no grayscale
+    /// `Image` constructor. Cheap enough to redo on every render: a byte loop,
+    /// not a decode, which is the whole reason the cache holds pixels rather
+    /// than the server's JPEG.
+    fn to_image(&self) -> Image {
+        let mut buffer = SharedPixelBuffer::<Rgb8Pixel>::new(self.width, self.height);
+        let width = self.width as usize;
+        let out = buffer.make_mut_slice();
+
+        for y in 0..self.height as usize {
+            for x in 0..width {
+                // Nibble back to a whole byte: duplicating it sends 15 to 255,
+                // where a bare shift would stop at 240 and grey out the whites.
+                let level = self.level(x, y);
+                let value = level << 4 | level;
+                out[y * width + x] = Rgb8Pixel {
+                    r: value,
+                    g: value,
+                    b: value,
+                };
+            }
+        }
+
+        Image::from_rgb8(buffer)
+    }
 }
 
 fn main() {
@@ -132,7 +221,7 @@ struct Pager {
     cmd_tx: Sender<Cmd>,
 
     all: RefCell<Vec<Book>>,
-    covers: RefCell<HashMap<i64, Image>>,
+    covers: RefCell<HashMap<i64, CachedCover>>,
     /// Порядок попадания в `covers` — по нему вытесняем самые старые обложки.
     cover_order: RefCell<VecDeque<i64>>,
     /// Что уже заказано у рабочего потока. Без этого каждая пришедшая обложка
@@ -205,12 +294,12 @@ impl Pager {
         self.dirty.set(true);
     }
 
-    fn set_cover(&self, id: i64, image: Image) {
+    fn set_cover(&self, id: i64, cover: CachedCover) {
         {
             let mut covers = self.covers.borrow_mut();
             let mut order = self.cover_order.borrow_mut();
 
-            if covers.insert(id, image).is_none() {
+            if covers.insert(id, cover).is_none() {
                 order.push_back(id);
             }
 
@@ -294,7 +383,7 @@ impl Pager {
                     author: book.author.clone().into(),
                     format: book.format.clone().unwrap_or_else(|| "—".to_string()).into(),
                     state: states.get(&book.id).copied().unwrap_or_default().into(),
-                    cover: covers.get(&book.id).cloned().unwrap_or_default(),
+                    cover: covers.get(&book.id).map(CachedCover::to_image).unwrap_or_default(),
                 })
                 .collect::<Vec<_>>(),
         );
@@ -487,15 +576,7 @@ fn apply(window: &MainWindow, pager: &Rc<Pager>, msg: Msg) {
         Msg::Busy(busy) => window.set_busy(busy),
         Msg::Books(list) => pager.set_books(list),
         Msg::BookState(id, state) => pager.set_state(id as i64, state),
-        Msg::Cover {
-            id,
-            rgb,
-            width,
-            height,
-        } => {
-            let buffer = SharedPixelBuffer::<Rgb8Pixel>::clone_from_slice(&rgb, width, height);
-            pager.set_cover(id, Image::from_rgb8(buffer));
-        }
+        Msg::Cover { id, cover } => pager.set_cover(id, cover),
     }
 }
 
@@ -591,14 +672,6 @@ fn apply_answer(
     let _ = cmd_tx.send(Cmd::Reconfigure(cfg.clone()));
 }
 
-fn decode_cover(jpeg: &[u8]) -> Result<(Vec<u8>, u32, u32), calibre::Error> {
-    let decoded = image::load_from_memory_with_format(jpeg, image::ImageFormat::Jpeg)?;
-    let rgb = decoded.to_rgb8();
-    let (width, height) = rgb.dimensions();
-
-    Ok((rgb.into_raw(), width, height))
-}
-
 fn worker(iv: &'static Inkview, cfg: Config, cmd_rx: Receiver<Cmd>, msg_tx: Sender<Msg>) {
     let mut cfg = cfg;
     let mut client = Client::new(&cfg);
@@ -627,15 +700,10 @@ fn worker(iv: &'static Inkview, cfg: Config, cmd_rx: Receiver<Cmd>, msg_tx: Send
                     let Ok(jpeg) = client.thumbnail(id, COVER_SIZE.0, COVER_SIZE.1) else {
                         continue;
                     };
-                    // Книга без обложки — обычное дело, молча оставляем пустое
-                    // место: ругаться в строке состояния тут не на что.
-                    if let Ok((rgb, width, height)) = decode_cover(&jpeg) {
-                        let _ = msg_tx.send(Msg::Cover {
-                            id,
-                            rgb,
-                            width,
-                            height,
-                        });
+                    // A book with no cover is routine — leave the space blank
+                    // rather than complaining in the status line.
+                    if let Ok(cover) = CachedCover::pack(&jpeg) {
+                        let _ = msg_tx.send(Msg::Cover { id, cover });
                     }
                 }
             }
@@ -707,5 +775,48 @@ fn worker(iv: &'static Inkview, cfg: Config, cmd_rx: Receiver<Cmd>, msg_tx: Send
         if noisy {
             let _ = msg_tx.send(Msg::Busy(false));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cover_packing_round_trip() {
+        // Width 3 is odd on purpose: the server preserves aspect ratio, so it
+        // hands back whatever width fits, and rows still have to land on a
+        // byte boundary.
+        let gray = image::GrayImage::from_raw(3, 2, vec![0, 15, 255, 16, 240, 128]).unwrap();
+        let packed = CachedCover::from_gray(&gray);
+
+        assert_eq!((packed.width, packed.height), (3, 2));
+        // Two bytes per row rather than three for the whole image.
+        assert_eq!(packed.pixels.len(), 4);
+
+        assert_eq!(packed.level(0, 0), 0);
+        assert_eq!(packed.level(1, 0), 0);
+        assert_eq!(packed.level(2, 0), 15);
+        assert_eq!(packed.level(0, 1), 1);
+        assert_eq!(packed.level(1, 1), 15);
+        assert_eq!(packed.level(2, 1), 8);
+
+        // The padding nibble of an odd row must stay clear, or it would read
+        // back as a stray dark pixel at the start of the next row.
+        assert_eq!(packed.pixels[1] & 0x0f, 0);
+    }
+
+    #[test]
+    fn white_survives_the_round_trip() {
+        let gray = image::GrayImage::from_raw(2, 1, vec![255, 0]).unwrap();
+        let packed = CachedCover::from_gray(&gray);
+
+        // Duplicating the nibble is what keeps white at 255; a bare shift left
+        // would cap it at 240 and tint every cover grey.
+        let white = packed.level(0, 0);
+        assert_eq!(white << 4 | white, 255);
+
+        let black = packed.level(1, 0);
+        assert_eq!(black << 4 | black, 0);
     }
 }
